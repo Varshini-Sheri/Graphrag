@@ -1,484 +1,306 @@
 package graphrag.api
 
+import graphrag.core.config.Neo4jConfig
 import graphrag.core.model._
 import graphrag.core.utils.Logging
 import graphrag.neo4j.Neo4jUtils
-import org.neo4j.driver.{Driver, Values}
-import org.neo4j.driver.types.Node
-
+import org.neo4j.driver.Driver
+import org.neo4j.driver.Values
+import org.neo4j.driver.Value
 import scala.collection.JavaConverters._
-import scala.util.Try
-
 import io.circe._
 import io.circe.generic.semiauto._
-
-import Neo4jValueHelpers._
-
 /**
  * Service for exploring the knowledge graph structure.
- * Returns lightweight neighborhoods with pagination per specification.
  */
 class ExploreService(driver: Driver) extends Logging {
 
-  def getNeighborhood(
-                       conceptId: String,
-                       direction: String = "both",
-                       depth: Int = 1,
-                       limit: Int = 50,
-                       edgeTypes: Seq[String] = Seq("RELATES_TO", "CO_OCCURS", "MENTIONS"),
-                       offset: Int = 0
-                     ): GraphNeighborhoodResponse = {
-    logInfo(s"Exploring neighborhood of $conceptId (direction: $direction, depth: $depth)")
+  /**
+   * Get neighborhood of a concept
+   */
+  def getNeighborhood(conceptId: String, maxDepth: Int = 1): GraphNeighborhood = {
+    logInfo(s"Exploring neighborhood of $conceptId (depth: $maxDepth)")
 
     Neo4jUtils.withSession(driver) { session =>
-      val directionPattern = direction match {
-        case "in"  => "<-"
-        case "out" => "->"
-        case _     => "-"
-      }
-
-      val edgeTypeFilter = edgeTypes.mkString("|")
-
-      val query =
-        s"""
-           |MATCH (center:Concept {id: $$conceptId})
-           |OPTIONAL MATCH path = (center)$directionPattern[r:$edgeTypeFilter*1..$depth]$directionPattern(neighbor)
-           |WHERE neighbor:Concept OR neighbor:Paper OR neighbor:Chunk
-           |WITH center,
-           |     collect(DISTINCT neighbor) as neighbors,
-           |     collect(DISTINCT {
-           |       from: CASE WHEN startNode(relationships(path)[0]) = center
-           |             THEN center.id
-           |             ELSE startNode(relationships(path)[0]).id END,
-           |       to: CASE WHEN endNode(relationships(path)[0]) = center
-           |           THEN center.id
-           |           ELSE endNode(relationships(path)[0]).id END,
-           |       type: type(relationships(path)[0]),
-           |       props: properties(relationships(path)[0])
-           |     }) as edges
-           |RETURN center, neighbors[$$offset..$$offset+$$limit] as paginatedNeighbors,
-           |       size(neighbors) as totalNeighbors, edges
-         """.stripMargin
+      val query = s"""
+                     |MATCH (center:Concept {id: $$conceptId})
+                     |OPTIONAL MATCH (center)-[r:RELATES_TO|CO_OCCURS*1..$maxDepth]-(neighbor:Concept)
+                     |WITH center, collect(DISTINCT neighbor) AS neighbors
+                     |OPTIONAL MATCH (center)-[rel:RELATES_TO|CO_OCCURS]-(n:Concept)
+                     |RETURN center, neighbors, collect(DISTINCT {from: startNode(rel).id, to: endNode(rel).id, type: type(rel), props: properties(rel)}) AS edges
+      """.stripMargin
 
       val result = session.run(
         query,
-        Values.parameters(
-          "conceptId", conceptId,
-          "offset", Long.box(offset),
-          "limit", Long.box(limit)
-        )
+        Values.parameters("conceptId", conceptId)
       )
 
-      if (!result.hasNext) {
-        return GraphNeighborhoodResponse(
-          center = GraphNode(conceptId, "Concept", Map("error" -> "NOT_FOUND")),
-          nodes = Seq.empty,
-          edges = Seq.empty,
-          page = PageInfo(limit, Some(offset), Some(0L), None)
+
+      if (result.hasNext) {
+        val record = result.next()
+        val centerNode = record.get("center").asNode()
+        val center = nodeToConcept(centerNode)
+
+        val neighbors = record.get("neighbors").asList().asScala.map { v =>
+          val node = v.asInstanceOf[Value].asNode()
+          nodeToConcept(node)
+        }.toSeq
+
+
+        val edges = record.get("edges").asList().asScala.flatMap { v =>
+          val map = v.asInstanceOf[Value].asMap().asScala
+
+          for {
+            from <- map.get("from").map(_.toString)
+            to <- map.get("to").map(_.toString)
+            relType <- map.get("type").map(_.toString)
+          } yield GraphEdge(from, to, relType, Map.empty[String, Any])
+        }.toSeq
+
+        GraphNeighborhood(center, neighbors, edges)
+      } else {
+        GraphNeighborhood(
+          Concept("", "", conceptId, "NOT_FOUND", "NOT_FOUND"),
+          Seq.empty,
+          Seq.empty
         )
       }
-
-      val record     = result.next()
-      val centerNode = record.get("center").asNode()
-      val center = GraphNode(
-        id = getNodeString(centerNode, "id"),
-        label = "Concept",
-        props = Map(
-          "lemma"   -> getNodeString(centerNode, "lemma"),
-          "surface" -> getNodeString(centerNode, "surface")
-        )
-      )
-
-      // neighbors
-      val neighbors = record.get("paginatedNeighbors").asList().asScala.flatMap { v =>
-        extractNode(v).map { node =>
-          val labels = node.labels().asScala.toSeq
-          GraphNode(
-            id = getNodeString(node, "id"),
-            label = labels.headOption.getOrElse("Node"),
-            props = extractNodeProps(node, labels.headOption.getOrElse("Node"))
-          )
-        }
-      }.toSeq
-
-      // edges – Try(...).toOption.getOrElse(None) so flatMap works in 2.12
-      val edges = record.get("edges").asList().asScala.flatMap { v =>
-        Try {
-          toValue(v).map { value =>
-            val map = value.asMap().asScala
-            GraphEdge(
-              from = map("from").toString,
-              to   = map("to").toString,
-              `type` = map("type").toString,
-              props = map
-                .get("props")
-                .map { p =>
-                  p.asInstanceOf[java.util.Map[String, Any]]
-                    .asScala
-                    .toMap
-                    .map { case (k, vv) => k -> anyToJsonValue(vv) }
-                }
-                .getOrElse(Map.empty[String, Any])
-            )
-          }
-        }.toOption.getOrElse(None)
-      }.toSeq
-
-      val totalNeighbors = record.get("totalNeighbors").asLong()
-      val hasMore        = offset + limit < totalNeighbors
-      val nextPageToken  = if (hasMore) Some(s"offset:${offset + limit}") else None
-
-      GraphNeighborhoodResponse(
-        center = center,
-        nodes  = neighbors,
-        edges  = edges,
-        page   = PageInfo(
-          limit          = limit,
-          offset         = Some(offset),
-          total          = Some(totalNeighbors),
-          nextPageToken  = nextPageToken
-        )
-      )
     }
   }
 
-  def findPaths(
-                 fromId: String,
-                 toId: String,
-                 maxLength: Int = 4,
-                 limit: Int = 10
-               ): Seq[GraphPath] = {
+  /**
+   * Find paths between two concepts
+   */
+  def findPaths(fromId: String, toId: String, maxLength: Int = 4): Seq[GraphPath] = {
     logInfo(s"Finding paths from $fromId to $toId (max length: $maxLength)")
 
     Neo4jUtils.withSession(driver) { session =>
-      val query =
-        s"""
-           |MATCH path = allShortestPaths(
-           |  (a:Concept {id: $$fromId})-[:RELATES_TO|CO_OCCURS*1..$maxLength]-
-           |  (b:Concept {id: $$toId})
-           |)
-           |WITH path, length(path) as pathLength
-           |ORDER BY pathLength
-           |LIMIT $$limit
-           |RETURN nodes(path) AS nodes, relationships(path) AS rels, pathLength
-         """.stripMargin
+      val query = s"""
+                     |MATCH path = (a:Concept {id: $$fromId})-[:RELATES_TO*1..$maxLength]-(b:Concept {id: $$toId})
+                     |RETURN nodes(path) AS nodes, relationships(path) AS rels
+                     |LIMIT 10
+      """.stripMargin
 
       val result = session.run(
         query,
-        Values.parameters("fromId", fromId, "toId", toId, "limit", Long.box(limit))
+        Values.parameters("fromId", fromId, "toId", toId)
       )
 
+
       result.list().asScala.map { record =>
-        val nodes = record.get("nodes").asList().asScala.flatMap { v =>
-          extractNode(v).map { n =>
-            val labels = n.labels().asScala.toSeq
-            GraphNode(
-              id = getNodeString(n, "id"),
-              label = labels.headOption.getOrElse("Node"),
-              props = extractNodeProps(n, labels.headOption.getOrElse("Node"))
-            )
-          }
+        val nodes = record.get("nodes").asList().asScala.map { v =>
+          nodeToConcept(v.asInstanceOf[Value].asNode())
         }.toSeq
 
-        val edges = record.get("rels").asList().asScala.flatMap { v =>
-          Try {
-            toValue(v).map { value =>
-              val rel = value.asRelationship()
-              GraphEdge(
-                from  = rel.startNodeId().toString,
-                to    = rel.endNodeId().toString,
-                `type` = rel.`type`(),
-                props  = rel.asMap().asScala.toMap.map {
-                  case (k, vv) => k -> anyToJsonValue(vv)
-                }
-              )
-            }
-          }.toOption.getOrElse(None)
+        val edges = record.get("rels").asList().asScala.map { v =>
+          val rel = v.asInstanceOf[Value].asRelationship()
+          GraphEdge(
+            from = rel.startNodeId().toString,
+            to = rel.endNodeId().toString,
+            relType = rel.`type`(),
+            props = rel.asMap().asScala.toMap.map { case (k, v) => k -> v.asInstanceOf[Any] }
+          )
         }.toSeq
 
-        GraphPath(
-          nodes  = nodes,
-          edges  = edges,
-          length = record.get("pathLength").asInt()
-        )
+        GraphPath(nodes, edges, nodes.size - 1)
       }.toSeq
     }
   }
 
+  /**
+   * Get graph statistics
+   */
   def getStatistics(): GraphStatistics = {
     logInfo("Fetching graph statistics")
 
     val stats = Neo4jUtils.getStats(driver)
 
     GraphStatistics(
-      conceptCount      = stats.getOrElse("nodes:Concept", 0L),
-      paperCount        = stats.getOrElse("nodes:Paper", 0L),
-      chunkCount        = stats.getOrElse("nodes:Chunk", 0L),
-      datasetCount      = stats.getOrElse("nodes:Dataset", 0L),
-      mentionsCount     = stats.getOrElse("rels:MENTIONS", 0L),
-      relationsCount    = stats.getOrElse("rels:RELATES_TO", 0L),
-      coOccurrenceCount = stats.getOrElse("rels:CO_OCCURS", 0L),
-      hasChunkCount     = stats.getOrElse("rels:HAS_CHUNK", 0L)
+      conceptCount = stats.getOrElse("nodes:Concept", 0L),
+      chunkCount = stats.getOrElse("nodes:Chunk", 0L),
+      mentionsCount = stats.getOrElse("rels:MENTIONS", 0L),
+      relationsCount = stats.getOrElse("rels:RELATES_TO", 0L),
+      coOccurrenceCount = stats.getOrElse("rels:CO_OCCURS", 0L)
     )
   }
 
-  def getTopConcepts(limit: Int = 10, sortBy: String = "connections"): Seq[ConceptWithScore] = {
+  /**
+   * Get top concepts by connection count
+   */
+  def getTopConcepts(limit: Int = 10): Seq[ConceptWithScore] = {
     Neo4jUtils.withSession(driver) { session =>
-      val sortClause = sortBy match {
-        case "mentions" => "mentionCount"
-        case "papers"   => "paperCount"
-        case _          => "connections"
-      }
-
-      val query =
-        s"""
-           |MATCH (c:Concept)
-           |OPTIONAL MATCH (c)-[r]-()
-           |OPTIONAL MATCH (c)<-[:MENTIONS]-(chunk:Chunk)
-           |OPTIONAL MATCH (chunk)<-[:HAS_CHUNK]-(p:Paper)
-           |WITH c, count(DISTINCT r) AS connections,
-           |        count(DISTINCT chunk) AS mentionCount,
-           |        count(DISTINCT p) AS paperCount
-           |RETURN c, connections, mentionCount, paperCount
-           |ORDER BY $sortClause DESC
-           |LIMIT $$limit
-         """.stripMargin
+      val query = """
+                    |MATCH (c:Concept)-[r]-()
+                    |RETURN c, count(r) AS connections
+                    |ORDER BY connections DESC
+                    |LIMIT $limit
+      """.stripMargin
 
       val result = session.run(
         query,
         Values.parameters("limit", Long.box(limit))
       )
 
-      result.list().asScala.map { record =>
-        val node = record.get("c").asNode()
-        val score = sortBy match {
-          case "mentions" => record.get("mentionCount").asLong().toDouble
-          case "papers"   => record.get("paperCount").asLong().toDouble
-          case _          => record.get("connections").asLong().toDouble
-        }
 
-        ConceptWithScore(
-          concept = Concept(
-            conceptId = getNodeString(node, "id"),
-            lemma     = getNodeString(node, "lemma"),
-            surface   = getNodeString(node, "surface"),
-            origin    = getNodeString(node, "origin"),
-            name      = getNodeString(node, "name")
-          ),
-          score     = score,
-          scoreType = sortBy
-        )
+      result.list().asScala.map { record =>
+        val concept = nodeToConcept(record.get("c").asNode())
+        val score = record.get("connections").asLong().toDouble
+        ConceptWithScore(concept, score)
       }.toSeq
     }
   }
 
-  def searchConcepts(
-                      pattern: String,
-                      limit: Int = 20,
-                      offset: Int = 0
-                    ): ConceptSearchResponse = {
+  /**
+   * Get clusters of related concepts
+   */
+  def getClusters(minSize: Int = 3): Seq[ConceptCluster] = {
     Neo4jUtils.withSession(driver) { session =>
-      val countQuery =
-        """
-          |MATCH (c:Concept)
-          |WHERE toLower(c.lemma)   CONTAINS toLower($pattern)
-          |   OR toLower(c.surface) CONTAINS toLower($pattern)
-          |RETURN count(c) as total
-        """.stripMargin
-
-      val countResult = session.run(
-        countQuery,
-        Values.parameters("pattern", pattern)
-      )
-      val total =
-        if (countResult.hasNext) countResult.next().get("total").asLong()
-        else 0L
-
-      val query =
-        """
-          |MATCH (c:Concept)
-          |WHERE toLower(c.lemma)   CONTAINS toLower($pattern)
-          |   OR toLower(c.surface) CONTAINS toLower($pattern)
-          |RETURN c
-          |ORDER BY c.surface
-          |SKIP $offset
-          |LIMIT $limit
-        """.stripMargin
+      val query = """
+                    |MATCH (c:Concept)-[:RELATES_TO]-(related:Concept)
+                    |WITH c, collect(DISTINCT related) AS cluster
+                    |WHERE size(cluster) >= $minSize
+                    |RETURN c AS center, cluster
+                    |LIMIT 20
+      """.stripMargin
 
       val result = session.run(
         query,
-        Values.parameters(
-          "pattern", pattern,
-          "offset",  Long.box(offset),
-          "limit",   Long.box(limit)
-        )
+        Values.parameters("minSize", Long.box(minSize))
       )
 
-      val concepts = result.list().asScala.map { record =>
-        val node = record.get("c").asNode()
-        Concept(
-          conceptId = getNodeString(node, "id"),
-          lemma     = getNodeString(node, "lemma"),
-          surface   = getNodeString(node, "surface"),
-          origin    = getNodeString(node, "origin"),
-          name      = getNodeString(node, "name")
-        )
+
+      result.list().asScala.map { record =>
+        val center = nodeToConcept(record.get("center").asNode())
+        val members = record.get("cluster").asList().asScala.map { node =>
+          nodeToConcept(node.asInstanceOf[Value].asNode())
+        }.toSeq
+        ConceptCluster(center, members)
       }.toSeq
-
-      val hasMore       = offset + limit < total
-      val nextPageToken = if (hasMore) Some(s"offset:${offset + limit}") else None
-
-      ConceptSearchResponse(
-        concepts = concepts,
-        page = PageInfo(
-          limit         = limit,
-          offset        = Some(offset),
-          total         = Some(total),
-          nextPageToken = nextPageToken
-        )
-      )
     }
   }
 
-  private def extractNodeProps(node: Node, label: String): Map[String, Any] =
-    Try {
-      label match {
-        case "Concept" =>
-          Map[String, Any](
-            "lemma"   -> getNodeString(node, "lemma"),
-            "surface" -> getNodeString(node, "surface")
-          )
-        case "Paper" =>
-          Map[String, Any](
-            "title" -> getNodeString(node, "title"),
-            "year"  -> getNodeInt(node, "year")
-          )
-        case "Dataset" =>
-          Map[String, Any]("name" -> getNodeString(node, "name"))
-        case _ =>
-          Map.empty[String, Any]
-      }
-    }.getOrElse(Map.empty[String, Any])
+  /**
+   * Search concepts by lemma pattern
+   */
+  def searchConcepts(pattern: String, limit: Int = 20): Seq[Concept] = {
+    Neo4jUtils.withSession(driver) { session =>
+      val query = """
+                    |MATCH (c:Concept)
+                    |WHERE c.lemma CONTAINS $pattern OR c.surface CONTAINS $pattern
+                    |RETURN c
+                    |LIMIT $limit
+      """.stripMargin
+
+      val result = session.run(
+        query,
+        Values.parameters("pattern", pattern.toLowerCase, "limit", Long.box(limit))
+      )
+
+
+      result.list().asScala.map { record =>
+        nodeToConcept(record.get("c").asNode())
+      }.toSeq
+    }
+  }
+
+  private def nodeToConcept(node: org.neo4j.driver.types.Node): Concept = {
+    Concept(
+      conceptId = node.get("id").asString(),
+      lemma = node.get("lemma").asString(),
+      surface = node.get("surface").asString(),
+      origin = node.get("origin").asString(),
+      name = node.get("name").asString()
+    )
+  }
 }
 
-/** ---------- Response models ---------- */
-
-case class GraphNeighborhoodResponse(
-                                      center: GraphNode,
-                                      nodes:  Seq[GraphNode],
-                                      edges:  Seq[GraphEdge],
-                                      page:   PageInfo
-                                    )
-
-case class GraphNode(
-                      id:    String,
-                      label: String,
-                      props: Map[String, Any]
-                    )
+// Response models
+case class GraphNeighborhood(
+                              center: Concept,
+                              neighbors: Seq[Concept],
+                              edges: Seq[GraphEdge]
+                            )
 
 case class GraphEdge(
-                      from:  String,
-                      to:    String,
-                      `type`: String,
+                      from: String,
+                      to: String,
+                      relType: String,
                       props: Map[String, Any]
                     )
 
 case class GraphPath(
-                      nodes:  Seq[GraphNode],
-                      edges:  Seq[GraphEdge],
+                      nodes: Seq[Concept],
+                      edges: Seq[GraphEdge],
                       length: Int
                     )
 
-case class PageInfo(
-                     limit:         Int,
-                     offset:        Option[Int]  = None,
-                     total:         Option[Long] = None,
-                     nextPageToken: Option[String] = None
-                   )
-
 case class GraphStatistics(
-                            conceptCount:      Long,
-                            paperCount:        Long,
-                            chunkCount:        Long,
-                            datasetCount:      Long,
-                            mentionsCount:     Long,
-                            relationsCount:    Long,
-                            coOccurrenceCount: Long,
-                            hasChunkCount:     Long
+                            conceptCount: Long,
+                            chunkCount: Long,
+                            mentionsCount: Long,
+                            relationsCount: Long,
+                            coOccurrenceCount: Long
                           )
 
 case class ConceptWithScore(
-                             concept:   Concept,
-                             score:     Double,
-                             scoreType: String
+                             concept: Concept,
+                             score: Double
                            )
 
-case class ConceptSearchResponse(
-                                  concepts: Seq[Concept],
-                                  page:     PageInfo
-                                )
+case class ConceptCluster(
+                           center: Concept,
+                           members: Seq[Concept]
+                         )
 
-/** ---------- Encoders ---------- */
+object ExploreService {
+  def apply(driver: Driver): ExploreService = new ExploreService(driver)
+
+  def apply(config: Neo4jConfig): ExploreService = {
+    val driver = Neo4jUtils.createDriver(config)
+    new ExploreService(driver)
+  }
+}
 
 object ExploreServiceEncoders {
 
+  // Convert Any → Json safely
   private def anyToJson(v: Any): Json = v match {
     case s: String  => Json.fromString(s)
     case n: Int     => Json.fromInt(n)
     case n: Long    => Json.fromLong(n)
     case n: Double  => Json.fromDoubleOrNull(n)
     case b: Boolean => Json.fromBoolean(b)
-    case null       => Json.Null
+
+    // Nested Map
     case m: Map[_, _] =>
       Json.obj(
-        m.asInstanceOf[Map[String, Any]].toSeq.map {
-          case (k, value) => k -> anyToJson(value)
-        }: _*
+        m.collect { case (k: String, value) => k -> anyToJson(value) }.toSeq: _*
       )
-    case other => Json.fromString(other.toString)
+
+    // Sequences
+    case s: Seq[_] =>
+      Json.arr(s.map(anyToJson): _*)
+
+    // Fallback
+    case other =>
+      Json.fromString(other.toString)
   }
 
-  implicit val graphNodeEncoder: Encoder[GraphNode] = Encoder.instance { node =>
-    Json.obj(
-      "id"    -> Json.fromString(node.id),
-      "label" -> Json.fromString(node.label),
-      "props" -> Json.obj(
-        node.props.toSeq.map { case (k, v) => k -> anyToJson(v) }: _*
+  // -------- GraphEdge encoder (manual because of Map[String, Any]) --------
+  implicit val graphEdgeEncoder: Encoder[GraphEdge] =
+    Encoder.instance { e =>
+      Json.obj(
+        "from"    -> Json.fromString(e.from),
+        "to"      -> Json.fromString(e.to),
+        "relType" -> Json.fromString(e.relType),
+        "props"   -> Json.obj(
+          e.props.toSeq.map { case (k, v) => k -> anyToJson(v) }: _*
+        )
       )
-    )
-  }
+    }
 
-  implicit val graphEdgeEncoder: Encoder[GraphEdge] = Encoder.instance { edge =>
-    Json.obj(
-      "from"  -> Json.fromString(edge.from),
-      "to"    -> Json.fromString(edge.to),
-      "type"  -> Json.fromString(edge.`type`),
-      "props" -> Json.obj(
-        edge.props.toSeq.map { case (k, v) => k -> anyToJson(v) }: _*
-      )
-    )
-  }
-
-  implicit val conceptEncoder: Encoder[Concept] = Encoder.instance { c =>
-    Json.obj(
-      "conceptId" -> Json.fromString(c.conceptId),
-      "lemma"     -> Json.fromString(c.lemma),
-      "surface"   -> Json.fromString(c.surface),
-      "origin"    -> Json.fromString(c.origin)
-    )
-  }
-
-  implicit val pageInfoEncoder:                Encoder[PageInfo]                = deriveEncoder
-  implicit val graphPathEncoder:               Encoder[GraphPath]               = deriveEncoder
-  implicit val neighborhoodEncoder:            Encoder[GraphNeighborhoodResponse] = deriveEncoder
-  implicit val statisticsEncoder:              Encoder[GraphStatistics]         = deriveEncoder
-  implicit val conceptWithScoreEncoder:        Encoder[ConceptWithScore]        = deriveEncoder
-  implicit val conceptSearchResponseEncoder:   Encoder[ConceptSearchResponse]   = deriveEncoder
-}
-
-/** ---------- Companion ---------- */
-
-object ExploreService {
-  def apply(driver: Driver): ExploreService =
-    new ExploreService(driver)
+  // -------- Circe can auto-derive these --------
+  implicit val conceptEncoder: Encoder[Concept] = deriveEncoder
+  implicit val pathEncoder: Encoder[GraphPath] = deriveEncoder
+  implicit val neighborhoodEncoder: Encoder[GraphNeighborhood] = deriveEncoder
 }

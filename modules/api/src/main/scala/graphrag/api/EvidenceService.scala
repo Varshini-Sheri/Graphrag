@@ -1,84 +1,29 @@
 package graphrag.api
 
+import graphrag.core.config.Neo4jConfig
 import graphrag.core.model._
 import graphrag.core.utils.Logging
 import graphrag.neo4j.Neo4jUtils
 import org.neo4j.driver.{Driver, Values, Value}
-import org.neo4j.driver.types.Node
+
 import scala.collection.JavaConverters._
 import scala.util.Try
-import io.circe._
-import io.circe.generic.semiauto._
-import Neo4jValueHelpers._
 
 /**
  * Service for retrieving evidence supporting relations in the knowledge graph.
- * Returns stored snippets with proper paper references per specification.
- * FIXED: All Neo4j type issues resolved using Neo4jValueHelpers
  */
 class EvidenceService(driver: Driver) extends Logging {
 
-  def getEvidenceById(evidenceId: String): Option[EvidenceResponse] = {
-    if (!evidenceId.startsWith("evid:")) {
-      return None
-    }
-
-    val chunkId = evidenceId.stripPrefix("evid:")
-
+  /**
+   * Get evidence for a specific relation
+   */
+  def getEvidenceForRelation(fromConceptId: String, toConceptId: String): Seq[Evidence] = {
     Neo4jUtils.withSession(driver) { session =>
-      val query = """
-                    |MATCH (chunk:Chunk {id: $chunkId})
-                    |MATCH (p:Paper)-[:HAS_CHUNK]->(chunk)
-                    |OPTIONAL MATCH (chunk)-[:MENTIONS]->(c:Concept)
-                    |RETURN chunk, p, collect(DISTINCT c) as concepts
-      """.stripMargin
-
-      val result = session.run(
-        query,
-        Values.parameters("chunkId", chunkId)
-      )
-
-      if (result.hasNext) {
-        val record = result.next()
-        val chunk = record.get("chunk").asNode()
-        val paper = record.get("p").asNode()
-
-        // FIXED: Use Neo4jValueHelpers for concepts list
-        val concepts = record.get("concepts").asList().asScala.flatMap { c =>
-          extractNode(c).map(node => getNodeString(node, "surface"))
-        }.toSeq
-
-        Some(EvidenceResponse(
-          evidenceId = evidenceId,
-          paperId = getNodeString(paper, "id"),
-          chunkId = chunkId,
-          text = getNodeString(chunk, "text"),
-          docRef = DocRef(
-            title = getNodeString(paper, "title"),
-            year = getNodeInt(paper, "year"),
-            url = getNodeString(paper, "url"),
-            authors = if (paper.containsKey("authors"))
-              Some(getNodeString(paper, "authors")) else None
-          ),
-          span = if (chunk.containsKey("spanStart") && chunk.containsKey("spanEnd"))
-            Some(s"p.${getNodeInt(chunk, "spanStart")}-${getNodeInt(chunk, "spanEnd")}")
-          else None,
-          concepts = concepts
-        ))
-      } else {
-        None
-      }
-    }
-  }
-
-  def getEvidenceForRelation(fromConceptId: String, toConceptId: String): Seq[EvidenceResponse] = {
-    Neo4jUtils.withSession(driver) { session =>
-      val query = """
-                    |MATCH (a:Concept {id: $fromId})-[r:RELATES_TO]->(b:Concept {id: $toId})
-                    |OPTIONAL MATCH (p:Paper)-[:HAS_CHUNK]->(chunk:Chunk)-[:MENTIONS]->(a)
-                    |WHERE (chunk)-[:MENTIONS]->(b)
-                    |RETURN r, p, chunk, a.surface as fromSurface, b.surface as toSurface
-                    |LIMIT 10
+      val query =
+        """
+          |MATCH (a:Concept {id: $fromId})-[r:RELATES_TO]->(b:Concept {id: $toId})
+          |OPTIONAL MATCH (a)<-[:MENTIONS]-(chunk:Chunk)-[:MENTIONS]->(b)
+          |RETURN a, r, b, collect(chunk) AS chunks
       """.stripMargin
 
       val params = Values.parameters(
@@ -87,197 +32,159 @@ class EvidenceService(driver: Driver) extends Logging {
       )
       val result = session.run(query, params)
 
-      result.list().asScala.flatMap { record =>
-        // FIXED: Check if chunk is null using isNullValue
-        if (!isNullValue(record.get("chunk"))) {
-          val chunk = record.get("chunk").asNode()
-          val paper = record.get("p").asNode()
-          val relation = record.get("r").asRelationship()
+      if (!result.hasNext) {
+        Seq.empty
+      } else {
+        val record = result.next()
 
-          val evidenceId = s"evid:${getNodeString(chunk, "id")}"
+        val relation = record.get("r").asRelationship()
+        val chunksValue = record.get("chunks")
 
-          Some(EvidenceResponse(
-            evidenceId = evidenceId,
-            paperId = getNodeString(paper, "id"),
-            chunkId = getNodeString(chunk, "id"),
-            text = getNodeString(chunk, "text"),
-            docRef = DocRef(
-              title = getNodeString(paper, "title"),
-              year = getNodeInt(paper, "year"),
-              url = getNodeString(paper, "url"),
-              authors = if (paper.containsKey("authors"))
-                Some(getNodeString(paper, "authors")) else None
-            ),
-            span = if (chunk.containsKey("spanStart") && chunk.containsKey("spanEnd"))
-              Some(s"p.${getNodeInt(chunk, "spanStart")}-${getNodeInt(chunk, "spanEnd")}")
-            else None,
-            concepts = Seq(
-              record.get("fromSurface").asString(),
-              record.get("toSurface").asString()
-            ),
-            relationInfo = Some(RelationInfo(
-              predicate = if (relation.containsKey("predicate"))
-                relation.get("predicate").asString("") else "",
-              confidence = if (relation.containsKey("confidence"))
-                relation.get("confidence").asDouble(0.0) else 0.0
-            ))
-          ))
-        } else {
-          None
-        }
-      }.toSeq
+        val chunks =
+          if (chunksValue == null || chunksValue.isNull) {
+            Seq.empty[ChunkEvidence]
+          } else {
+            chunksValue
+              .asList((v: Value) => v)
+              .asScala
+              .collect {
+                case v if !v.isNull =>
+                  val node = v.asNode()
+                  ChunkEvidence(
+                    chunkId = node.get("id").asString(),
+                    text    = node.get("text").asString(),
+                    docId   = node.get("docId").asString()
+                  )
+              }
+              .toSeq
+          }
+
+        Seq(
+          Evidence(
+            predicate = relation.get("predicate").asString(),
+            confidence = relation.get("confidence").asDouble(),
+            explanation = relation.get("evidence").asString(), // or "explanation"
+            chunks = chunks
+          )
+        )
+      }
     }
   }
 
-  def getEvidenceForConcept(conceptId: String, limit: Int = 10): Seq[EvidenceResponse] = {
+
+  /**
+   * Get all evidence for a concept
+   */
+  def getEvidenceForConcept(conceptId: String): Seq[Evidence] = {
     Neo4jUtils.withSession(driver) { session =>
       val query = """
-                    |MATCH (c:Concept {id: $conceptId})<-[:MENTIONS]-(chunk:Chunk)<-[:HAS_CHUNK]-(p:Paper)
-                    |OPTIONAL MATCH (chunk)-[:MENTIONS]->(related:Concept)
-                    |WHERE related.id <> $conceptId
-                    |WITH chunk, p, c, collect(DISTINCT related.surface) as relatedSurfaces
-                    |RETURN chunk, p, c.surface as conceptSurface, relatedSurfaces
-                    |LIMIT $limit
+                    |MATCH (c:Concept {id: $conceptId})<-[:MENTIONS]-(chunk:Chunk)
+                    |RETURN c, collect(chunk) AS chunks
       """.stripMargin
 
-      val params = Values.parameters("conceptId", conceptId, "limit", Long.box(limit))
+      val params = Values.parameters("conceptId", conceptId)
       val result = session.run(query, params)
 
-      result.list().asScala.map { record =>
-        val chunk = record.get("chunk").asNode()
-        val paper = record.get("p").asNode()
-        val conceptSurface = record.get("conceptSurface").asString()
+      if (result.hasNext) {
+        val record = result.next()
+        val chunksValue = record.get("chunks")
 
-        // FIXED: Use Neo4jValueHelpers for relatedSurfaces list
-        val relatedSurfaces = record.get("relatedSurfaces").asList().asScala.flatMap { v =>
-          if (!isNullValue(v)) {
-            toValue(v).map(_.asString())
-          } else None
-        }.toSeq
+        val chunks = if (!chunksValue.isNull) {
+          chunksValue.asList((v: Value) => v).asScala.map { chunkValue =>
 
-        val evidenceId = s"evid:${getNodeString(chunk, "id")}"
+            val node = chunkValue.asNode()
+            ChunkEvidence(
+              chunkId = node.get("id").asString(),
+              text = node.get("text").asString(),
+              docId = node.get("docId").asString()
+            )
+          }.toSeq
+        } else {
+          Seq.empty[ChunkEvidence]
+        }
 
-        EvidenceResponse(
-          evidenceId = evidenceId,
-          paperId = getNodeString(paper, "id"),
-          chunkId = getNodeString(chunk, "id"),
-          text = getNodeString(chunk, "text"),
-          docRef = DocRef(
-            title = getNodeString(paper, "title"),
-            year = getNodeInt(paper, "year"),
-            url = getNodeString(paper, "url"),
-            authors = if (paper.containsKey("authors"))
-              Some(getNodeString(paper, "authors")) else None
-          ),
-          span = if (chunk.containsKey("spanStart") && chunk.containsKey("spanEnd"))
-            Some(s"p.${getNodeInt(chunk, "spanStart")}-${getNodeInt(chunk, "spanEnd")}")
-          else None,
-          concepts = Seq(conceptSurface) ++ relatedSurfaces
-        )
-      }.toSeq
+        Seq(Evidence(
+          predicate = "mentioned_in",
+          confidence = 1.0,
+          explanation = s"Concept appears in ${chunks.size} chunks",
+          chunks = chunks
+        ))
+      } else {
+        Seq.empty
+      }
     }
   }
 
-  def getCoOccurrenceEvidence(conceptA: String, conceptB: String, limit: Int = 10): Seq[EvidenceResponse] = {
+  /**
+   * Get co-occurrence evidence between two concepts
+   */
+  def getCoOccurrenceEvidence(conceptA: String, conceptB: String): Seq[Evidence] = {
     Neo4jUtils.withSession(driver) { session =>
       val query = """
-                    |MATCH (a:Concept {id: $aId}), (b:Concept {id: $bId})
+                    |MATCH (a:Concept {id: $aId})-[r:CO_OCCURS]-(b:Concept {id: $bId})
                     |MATCH (chunk:Chunk)-[:MENTIONS]->(a)
                     |WHERE (chunk)-[:MENTIONS]->(b)
-                    |MATCH (p:Paper)-[:HAS_CHUNK]->(chunk)
-                    |OPTIONAL MATCH (a)-[r:CO_OCCURS]-(b)
-                    |RETURN chunk, p, a.surface as aSurface, b.surface as bSurface, r
-                    |LIMIT $limit
+                    |RETURN r, collect(DISTINCT chunk) AS chunks
       """.stripMargin
 
       val params = Values.parameters(
         "aId", conceptA,
-        "bId", conceptB,
-        "limit", Long.box(limit)
+        "bId", conceptB
       )
       val result = session.run(query, params)
 
       result.list().asScala.map { record =>
-        val chunk = record.get("chunk").asNode()
-        val paper = record.get("p").asNode()
-        val aSurface = record.get("aSurface").asString()
-        val bSurface = record.get("bSurface").asString()
+        val relation = record.get("r").asRelationship()
+        val chunksValue = record.get("chunks")
 
-        val evidenceId = s"evid:${getNodeString(chunk, "id")}"
+        val chunks = if (!chunksValue.isNull) {
+          chunksValue.asList((v: Value) => v).asScala.map { chunkValue =>
+            val node = chunkValue.asNode()
+            ChunkEvidence(
+              chunkId = node.get("id").asString(),
+              text = node.get("text").asString(),
+              docId = node.get("docId").asString()
+            )
+          }.toSeq
+        } else {
+          Seq.empty[ChunkEvidence]
+        }
 
-        // FIXED: Use isNullValue for relationship check
-        val relationInfo = if (!isNullValue(record.get("r"))) {
-          val rel = record.get("r").asRelationship()
-          Some(RelationInfo(
-            predicate = "co_occurs",
-            confidence = if (rel.containsKey("confidence"))
-              rel.get("confidence").asDouble(0.0) else 0.0,
-            frequency = if (rel.containsKey("freq"))
-              Some(rel.get("freq").asLong()) else None
-          ))
-        } else None
-
-        EvidenceResponse(
-          evidenceId = evidenceId,
-          paperId = getNodeString(paper, "id"),
-          chunkId = getNodeString(chunk, "id"),
-          text = getNodeString(chunk, "text"),
-          docRef = DocRef(
-            title = getNodeString(paper, "title"),
-            year = getNodeInt(paper, "year"),
-            url = getNodeString(paper, "url"),
-            authors = if (paper.containsKey("authors"))
-              Some(getNodeString(paper, "authors")) else None
-          ),
-          span = if (chunk.containsKey("spanStart") && chunk.containsKey("spanEnd"))
-            Some(s"p.${getNodeInt(chunk, "spanStart")}-${getNodeInt(chunk, "spanEnd")}")
-          else None,
-          concepts = Seq(aSurface, bSurface),
-          relationInfo = relationInfo
+        Evidence(
+          predicate = "co_occurs",
+          confidence = 0.8,
+          explanation = s"Co-occurred ${relation.get("freq").asLong()} times",
+          chunks = chunks
         )
       }.toSeq
     }
   }
-
-  def getBatchEvidence(evidenceIds: Seq[String]): Seq[EvidenceResponse] = {
-    evidenceIds.flatMap(getEvidenceById)
-  }
 }
 
-case class EvidenceResponse(
-                             evidenceId: String,
-                             paperId: String,
-                             chunkId: String,
-                             text: String,
-                             docRef: DocRef,
-                             span: Option[String] = None,
-                             concepts: Seq[String] = Seq.empty,
-                             relationInfo: Option[RelationInfo] = None
-                           )
+/**
+ * Evidence supporting a relation
+ */
+case class Evidence(
+                     predicate: String,
+                     confidence: Double,
+                     explanation: String,
+                     chunks: Seq[ChunkEvidence]
+                   )
 
-case class DocRef(
-                   title: String,
-                   year: Int,
-                   url: String,
-                   authors: Option[String] = None
-                 )
-
-case class RelationInfo(
-                         predicate: String,
-                         confidence: Double,
-                         frequency: Option[Long] = None
-                       )
-
-object EvidenceServiceEncoders {
-  implicit val docRefEncoder: Encoder[DocRef] = deriveEncoder
-  implicit val relationInfoEncoder: Encoder[RelationInfo] = deriveEncoder
-  implicit val evidenceResponseEncoder: Encoder[EvidenceResponse] = deriveEncoder
-
-  implicit val docRefDecoder: Decoder[DocRef] = deriveDecoder
-  implicit val relationInfoDecoder: Decoder[RelationInfo] = deriveDecoder
-  implicit val evidenceResponseDecoder: Decoder[EvidenceResponse] = deriveDecoder
-}
+/**
+ * Chunk that provides evidence
+ */
+case class ChunkEvidence(
+                          chunkId: String,
+                          text: String,
+                          docId: String
+                        )
 
 object EvidenceService {
   def apply(driver: Driver): EvidenceService = new EvidenceService(driver)
+
+  def apply(config: Neo4jConfig): EvidenceService = {
+    val driver = Neo4jUtils.createDriver(config)
+    new EvidenceService(driver)
+  }
 }

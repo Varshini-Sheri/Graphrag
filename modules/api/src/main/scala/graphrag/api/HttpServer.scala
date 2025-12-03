@@ -5,33 +5,49 @@ import akka.http.scaladsl.Http
 import akka.http.scaladsl.server.Directives._
 import akka.http.scaladsl.model.{StatusCodes, HttpMethods}
 import akka.http.scaladsl.model.headers._
-import akka.http.scaladsl.server.{Directive0, ExceptionHandler, Route}
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.ExecutionContext
 import scala.util.{Success, Failure}
-import graphrag.core.config.GraphRagConfig
+import graphrag.core.config._
 import graphrag.core.utils.Logging
 import graphrag.neo4j.Neo4jUtils
 import graphrag.llm.OllamaClient
-import de.heikoseeberger.akkahttpcirce.FailFastCirceSupport._
-import io.circe.syntax._
+import com.typesafe.config.ConfigFactory
 
 object HttpServer extends App with Logging {
 
   implicit val system: ActorSystem = ActorSystem("graphrag-api")
   implicit val ec: ExecutionContext = system.dispatcher
 
-  logInfo("Loading GraphRAG configuration...")
-  val config = GraphRagConfig.load()
+  // Load configuration
+  val config = ConfigFactory.load()
 
-  val driver = Neo4jUtils.createDriver(config.neo4j)
-  val ollamaClient = OllamaClient(config.ollama)
+  val neo4jConfig = Neo4jConfig(
+    uri = sys.env.getOrElse("NEO4J_URI", config.getString("neo4j.uri")),
+    user = sys.env.getOrElse("NEO4J_USER", config.getString("neo4j.user")),
+    password = sys.env.getOrElse("NEO4J_PASSWORD", config.getString("neo4j.password")),
+    database = sys.env.getOrElse("NEO4J_DATABASE", config.getString("neo4j.database"))
+  )
 
-  val jobsService = JobsService(config)
-  val queryService = QueryService(driver, ollamaClient, jobsService)
+  val ollamaConfig = OllamaConfig(
+    endpoint = sys.env.getOrElse("OLLAMA_ENDPOINT", config.getString("ollama.endpoint")),
+    model = sys.env.getOrElse("OLLAMA_MODEL", config.getString("ollama.model")),
+    temperature = config.getDouble("ollama.temperature"),
+    timeoutMs = config.getInt("ollama.timeoutMs"),
+    maxRetries = config.getInt("ollama.maxRetries")
+  )
+
+  // Initialize services
+  logInfo("Initializing services...")
+  val driver = Neo4jUtils.createDriver(neo4jConfig)
+  val ollamaClient = OllamaClient(ollamaConfig)
+
+  val queryService = QueryService(driver, ollamaClient)
   val evidenceService = EvidenceService(driver)
   val exploreService = ExploreService(driver)
   val explainService = ExplainService(driver, ollamaClient)
+  val jobsService = JobsService()
 
+  // Create routes
   val apiRoutes = new Routes(
     queryService,
     evidenceService,
@@ -40,133 +56,42 @@ object HttpServer extends App with Logging {
     jobsService
   )
 
-  // -----------------------------------
-  // CORS
-  // -----------------------------------
-  private val corsHeaders = List(
+  // CORS support
+  val corsHeaders = List(
     `Access-Control-Allow-Origin`.*,
-    `Access-Control-Allow-Methods`(
-      HttpMethods.GET,
-      HttpMethods.POST,
-      HttpMethods.PUT,
-      HttpMethods.DELETE,
-      HttpMethods.OPTIONS
-    ),
-    `Access-Control-Allow-Headers`("Content-Type", "Authorization", "X-Trace-Id", "Idempotency-Key"),
-    `Access-Control-Max-Age`(3600)
+    `Access-Control-Allow-Methods`(HttpMethods.GET, HttpMethods.POST, HttpMethods.PUT, HttpMethods.DELETE, HttpMethods.OPTIONS),
+    `Access-Control-Allow-Headers`("Content-Type", "Authorization")
   )
 
-  def corsDirective: Directive0 =
-    respondWithHeaders(corsHeaders)
-
-  // -----------------------------------
-  // Trace ID
-  // -----------------------------------
-  def traceIdDirective: Directive0 =
-    extractRequestContext.flatMap { ctx =>
-      val incoming = ctx.request.headers.collectFirst { case h if h.lowercaseName == "x-trace-id" => h.value }
-      val traceId = incoming.getOrElse(s"tr-${System.currentTimeMillis()}")
-      respondWithHeader(RawHeader("X-Trace-Id", traceId))
-    }
-
-  // -----------------------------------
-  // Exception Handler
-  // -----------------------------------
-  import RoutesEncoders._
-
-  implicit def exceptionHandler: ExceptionHandler = ExceptionHandler {
-    case e: IllegalArgumentException =>
-      complete(
-        StatusCodes.BadRequest ->
-          ErrorResponse("Bad Request", "INVALID_REQUEST", e.getMessage, Some(s"tr-${System.currentTimeMillis()}")).asJson
-      )
-
-    case e: NoSuchElementException =>
-      complete(
-        StatusCodes.NotFound ->
-          ErrorResponse("Not Found", "RESOURCE_NOT_FOUND", e.getMessage, Some(s"tr-${System.currentTimeMillis()}")).asJson
-      )
-
-    case e: Throwable =>
-      complete(
-        StatusCodes.InternalServerError ->
-          ErrorResponse("Internal Server Error", "INTERNAL_ERROR", "An unexpected error occurred", Some(s"tr-${System.currentTimeMillis()}")).asJson
-      )
+  val routesWithCors = respondWithHeaders(corsHeaders) {
+    options {
+      complete(StatusCodes.OK)
+    } ~ apiRoutes.routes
   }
 
-  // -----------------------------------
-  // Rate Limit (Very Simple)
-  // -----------------------------------
-  private val rateLimitCache = scala.collection.concurrent.TrieMap[String, (Long, Int)]()
-  private val RATE_LIMIT = 100
-  private val RATE_WINDOW = 60000
-
-  def rateLimit(clientId: String): Directive0 = {
-    val now = System.currentTimeMillis()
-    val (windowStart, count) = rateLimitCache.getOrElse(clientId, (now, 0))
-
-    if (now - windowStart > RATE_WINDOW) {
-      rateLimitCache.put(clientId, (now, 1))
-      pass
-    } else if (count >= RATE_LIMIT) {
-      complete(
-        StatusCodes.TooManyRequests ->
-          ErrorResponse(
-            "Too Many Requests",
-            "RATE_LIMIT_EXCEEDED",
-            s"Rate limit of $RATE_LIMIT requests/min exceeded",
-            Some(s"tr-${System.currentTimeMillis()}")
-          ).asJson
-      )
-    } else {
-      rateLimitCache.put(clientId, (windowStart, count + 1))
-      pass
-    }
-  }
-
-  // -----------------------------------
-  // FINAL ROUTES WITH MIDDLEWARE
-  // -----------------------------------
-  val routesWithMiddleware: Route =
-    corsDirective {
-      traceIdDirective {
-        handleExceptions(exceptionHandler) {
-
-          // First handle OPTIONS for CORS
-          options {
-            complete(StatusCodes.OK)
-          } ~
-            // Actual routed requests
-            optionalHeaderValueByName("Authorization") { authOpt =>
-              val clientId = authOpt.getOrElse("anonymous")
-
-              rateLimit(clientId) {
-                apiRoutes.routes
-              }
-            }
-        }
-      }
-    }
-
-  // -----------------------------------
   // Start server
-  // -----------------------------------
   val port = sys.env.getOrElse("API_PORT", "8080").toInt
   val host = sys.env.getOrElse("API_HOST", "0.0.0.0")
 
-  Http()
-    .newServerAt(host, port)
-    .bind(routesWithMiddleware)
-    .onComplete {
-      case Success(binding) =>
-        logInfo(s"GraphRAG API started at http://$host:$port")
-      case Failure(e) =>
-        logError(s"Failed to bind: ${e.getMessage}", e)
-        system.terminate()
-    }
+  Http().newServerAt(host, port).bind(routesWithCors).onComplete {
+    case Success(binding) =>
+      logInfo(s"GraphRAG API server online at http://$host:$port/")
+      logInfo("Available endpoints:")
+      logInfo("  GET  /v1/health")
+      logInfo("  POST /v1/query")
+      logInfo("  GET  /v1/jobs/{jobId}")
+      logInfo("  GET  /v1/jobs/{jobId}/result")
+      logInfo("  GET  /v1/graph/concept/{id}/neighbors")
+      logInfo("  GET  /v1/graph/statistics")
+      logInfo("  GET  /v1/evidence/concept/{id}")
+      logInfo("  GET  /v1/explain/concept/{id}")
+    case Failure(exception) =>
+      logError(s"Failed to bind HTTP server: ${exception.getMessage}", exception)
+      system.terminate()
+  }
 
   sys.addShutdownHook {
-    logInfo("Shutting down GraphRAG API server...")
+    logInfo("Shutting down API server...")
     driver.close()
     system.terminate()
   }

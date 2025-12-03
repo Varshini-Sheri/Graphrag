@@ -1,203 +1,247 @@
-package graphrag.neo4j
+package graphrag.api
 
-import org.neo4j.driver._
-import java.util
+import graphrag.core.config.Neo4jConfig
+import graphrag.core.model._
+import graphrag.core.utils.Logging
+import graphrag.neo4j.Neo4jUtils
+import graphrag.llm.OllamaClient
+import org.neo4j.driver.Driver
+import org.neo4j.driver.Values
 import scala.collection.JavaConverters._
 
-class Neo4jClient(uri: String, user: String, password: String, database: String) {
+/**
+ * Service for querying the knowledge graph using natural language.
+ * Implements RAG (Retrieval Augmented Generation) pattern.
+ */
+class QueryService(driver: Driver, ollamaClient: OllamaClient) extends Logging {
 
-  private val driver: Driver =
-    GraphDatabase.driver(uri, AuthTokens.basic(user, password))
+  /**
+   * Query the knowledge graph with a natural language question
+   */
+  def query(question: String, maxResults: Int = 10): QueryResult = {
+    logInfo(s"Processing query: $question")
 
-  private def session(): Session =
-    driver.session(SessionConfig.forDatabase(database))
+    // Step 1: Extract concepts from question
+    val queryConcepts = extractQueryConcepts(question)
+    logInfo(s"Extracted ${queryConcepts.size} concepts from query")
 
-  // ============================================================
-  // DTOs (match API layer)
-  // ============================================================
+    // Step 2: Find matching concepts in graph
+    val matchedConcepts = findMatchingConcepts(queryConcepts, maxResults)
+    logInfo(s"Found ${matchedConcepts.size} matching concepts")
 
-  final case class ConceptHit(conceptId: String, lemma: String)
-  final case class NeighborHit(conceptId: String, weight: Long)
+    // Step 3: Retrieve relevant context
+    val context = retrieveContext(matchedConcepts, maxResults)
+    logInfo(s"Retrieved ${context.size} context items")
 
-  final case class GraphNode(id: String, label: String, props: Map[String, Any])
-  final case class GraphEdge(from: String, to: String, relType: String)
+    // Step 4: Generate answer using LLM
+    val answer = generateAnswer(question, context)
 
-  final case class Neighborhood(
-                                 center: GraphNode,
-                                 nodes: Seq[GraphNode],
-                                 edges: Seq[GraphEdge]
-                               )
-
-  final case class ChunkEvidence(
-                                  chunkId: String,
-                                  docId: String,
-                                  text: Option[String],
-                                  spanStart: Int,
-                                  spanEnd: Int
-                                )
-
-  // ============================================================
-  // 1. Substring concept search
-  // ============================================================
-
-  def findConceptsBySubstring(q: String, limit: Int): Seq[ConceptHit] = {
-    val cypher =
-      """MATCH (c:Concept)
-        |WHERE toLower(c.lemma) CONTAINS toLower($q)
-        |RETURN c.id AS id, c.lemma AS lemma
-        |LIMIT $limit""".stripMargin
-
-    val params = Map("q" -> q, "limit" -> Int.box(limit)).asJava
-
-    val s = session()
-    try {
-      val result = s.run(cypher, params)
-      result.list().asScala.map { r =>
-        ConceptHit(
-          conceptId = r.get("id").asString(),
-          lemma = r.get("lemma").asString()
-        )
-      }.toSeq
-    } finally s.close()
+    QueryResult(
+      question = question,
+      answer = answer,
+      concepts = matchedConcepts,
+      context = context,
+      confidence = calculateConfidence(matchedConcepts, context)
+    )
   }
 
-  // ============================================================
-  // 2. Top co-occurrences
-  // ============================================================
+  /**
+   * Find concepts by keyword search
+   */
+  def searchConcepts(keyword: String, limit: Int = 20): Seq[Concept] = {
+    Neo4jUtils.withSession(driver) { session =>
+      val query = """
+                    |MATCH (c:Concept)
+                    |WHERE toLower(c.lemma) CONTAINS toLower($keyword)
+                    |   OR toLower(c.surface) CONTAINS toLower($keyword)
+                    |RETURN c
+                    |LIMIT $limit
+      """.stripMargin
 
-  def getTopCoOccurringConcepts(conceptId: String, k: Int): Seq[NeighborHit] = {
-    val cypher =
-      """MATCH (:Concept {id: $id})-[r:CO_OCCURS]-(o:Concept)
-        |RETURN o.id AS id, r.freq AS freq
-        |ORDER BY freq DESC
-        |LIMIT $k""".stripMargin
+      val result = session.run(
+        query,
+        Values.parameters("keyword", keyword, "limit", Long.box(limit))
+      )
 
-    val params = Map("id" -> conceptId, "k" -> Int.box(k)).asJava
 
-    val s = session()
-    try {
-      val res = s.run(cypher, params)
-      res.list().asScala.map { r =>
-        NeighborHit(
-          conceptId = r.get("id").asString(),
-          weight = r.get("freq").asLong()
+      result.list().asScala.map { record =>
+        val node = record.get("c").asNode()
+        Concept(
+          conceptId = node.get("id").asString(),
+          lemma = node.get("lemma").asString(),
+          surface = node.get("surface").asString(),
+          origin = node.get("origin").asString(),
+          name = node.get("name").asString()
         )
       }.toSeq
-    } finally s.close()
+    }
   }
 
-  // ============================================================
-  // 3. Evidence lookup
-  // ============================================================
+  /**
+   * Get related concepts
+   */
+  def getRelatedConcepts(conceptId: String, limit: Int = 10): Seq[RelatedConcept] = {
+    Neo4jUtils.withSession(driver) { session =>
+      val query = """
+                    |MATCH (c:Concept {id: $conceptId})-[r:RELATES_TO]-(related:Concept)
+                    |RETURN related, r.predicate AS predicate, r.confidence AS confidence
+                    |ORDER BY confidence DESC
+                    |LIMIT $limit
+      """.stripMargin
 
-  def getEvidenceByChunkId(chunkId: String): Option[ChunkEvidence] = {
-    val cypher =
-      """MATCH (c:Chunk {id: $id})
-        |RETURN c.id AS chunkId,
-        |       c.docId AS docId,
-        |       c.text AS text,
-        |       c.spanStart AS spanStart,
-        |       c.spanEnd AS spanEnd""".stripMargin
+      val result = session.run(
+        query,
+        Values.parameters("conceptId", conceptId, "limit", Long.box(limit))
+      )
 
-    val params = Map("id" -> chunkId).asJava
 
-    val s = session()
-    try {
-      val rows = s.run(cypher, params).list().asScala
-      if (rows.isEmpty) None
-      else {
-        val r = rows.head
-        Some(
-          ChunkEvidence(
-            chunkId = r.get("chunkId").asString(),
-            docId = r.get("docId").asString(),
-            text =
-              if (r.get("text").isNull) None else Some(r.get("text").asString()),
-            spanStart = r.get("spanStart").asInt(),
-            spanEnd = r.get("spanEnd").asInt()
-          )
+      result.list().asScala.map { record =>
+        val node = record.get("related").asNode()
+        RelatedConcept(
+          concept = Concept(
+            conceptId = node.get("id").asString(),
+            lemma = node.get("lemma").asString(),
+            surface = node.get("surface").asString(),
+            origin = node.get("origin").asString(),
+            name = node.get("name").asString()
+          ),
+          predicate = record.get("predicate").asString(),
+          confidence = record.get("confidence").asDouble()
+        )
+      }.toSeq
+    }
+  }
+
+  /**
+   * Get chunks mentioning a concept
+   */
+  def getChunksForConcept(conceptId: String, limit: Int = 10): Seq[Chunk] = {
+    Neo4jUtils.withSession(driver) { session =>
+      val query = """
+                    |MATCH (chunk:Chunk)-[:MENTIONS]->(c:Concept {id: $conceptId})
+                    |RETURN chunk
+                    |LIMIT $limit
+      """.stripMargin
+
+      val result = session.run(
+        query,
+        Values.parameters("conceptId", conceptId, "limit", Long.box(limit))
+      )
+
+
+      result.list().asScala.map { record =>
+        val node = record.get("chunk").asNode()
+        Chunk(
+          chunkId = node.get("id").asString(),
+          docId = node.get("docId").asString(),
+          span = (node.get("spanStart").asInt(), node.get("spanEnd").asInt()),
+          text = node.get("text").asString(),
+          sourceUri = node.get("sourceUri").asString(),
+          hash = node.get("hash").asString()
+        )
+      }.toSeq
+    }
+  }
+
+  private def extractQueryConcepts(question: String): Seq[String] = {
+    // Simple keyword extraction
+    val stopWords = Set("what", "is", "are", "how", "does", "do", "the", "a", "an", "in", "on", "for", "to", "of", "and", "or")
+    question
+      .toLowerCase
+      .replaceAll("[^a-z0-9\\s]", "")
+      .split("\\s+")
+      .filter(word => word.length > 2 && !stopWords.contains(word))
+      .toSeq
+  }
+
+  private def findMatchingConcepts(queryTerms: Seq[String], limit: Int): Seq[Concept] = {
+    queryTerms.flatMap { term =>
+      searchConcepts(term, limit / queryTerms.size.max(1))
+    }.distinct.take(limit)
+  }
+
+  private def retrieveContext(concepts: Seq[Concept], maxItems: Int): Seq[ContextItem] = {
+    concepts.flatMap { concept =>
+      // Get chunks
+      val chunks = getChunksForConcept(concept.conceptId, 3)
+
+      // Get related concepts
+      val related = getRelatedConcepts(concept.conceptId, 3)
+
+      chunks.map { chunk =>
+        ContextItem(
+          conceptId = concept.conceptId,
+          conceptSurface = concept.surface,
+          text = chunk.text,
+          relatedConcepts = related.map(_.concept.surface),
+          sourceUri = chunk.sourceUri
         )
       }
-    } finally s.close()
+    }.take(maxItems)
   }
 
-  // ============================================================
-  // 4. Concept neighborhood
-  // ============================================================
+  private def generateAnswer(question: String, context: Seq[ContextItem]): String = {
+    if (context.isEmpty) {
+      return "I couldn't find relevant information in the knowledge graph to answer your question."
+    }
 
-  def getConceptNeighborhood(conceptId: String, limit: Int): Option[Neighborhood] = {
-    val params = Map("id" -> conceptId, "limit" -> Int.box(limit)).asJava
-    val s = session()
+    val contextText = context.map { item =>
+      s"[${item.conceptSurface}]: ${item.text}"
+    }.mkString("\n\n")
 
-    try {
-      // Fetch center node
-      val centerRows = s.run(
-        "MATCH (c:Concept {id: $id}) RETURN c",
-        Map("id" -> conceptId).asJava
-      ).list().asScala
+    val prompt = s"""Based on the following context from a knowledge graph about software engineering research, answer the question.
 
-      if (centerRows.isEmpty) return None
+Context:
+$contextText
 
-      val centerNode = centerRows.head.get("c").asNode()
-      val center = GraphNode(
-        id = centerNode.get("id").asString(),
-        label = centerNode.labels().asScala.headOption.getOrElse("Concept"),
-        props = centerNode.asMap().asScala.toMap
-      )
+Question: $question
 
-      // All neighbors
-      val cypher =
-        """MATCH (c:Concept {id: $id})
-          |OPTIONAL MATCH (c)-[:RELATES_TO]->(out:Concept)
-          |OPTIONAL MATCH (c)<-[:RELATES_TO]-(in:Concept)
-          |OPTIONAL MATCH (c)-[:CO_OCCURS]->(co:Concept)
-          |
-          |RETURN
-          |  collect(DISTINCT out) AS outNodes,
-          |  collect(DISTINCT in) AS inNodes,
-          |  collect(DISTINCT co) AS coNodes""".stripMargin
+Provide a clear, concise answer based only on the information in the context. If the context doesn't contain enough information, say so."""
 
-      val r = s.run(cypher, params).list().asScala.head
-
-      def convert(v: Value): Seq[GraphNode] =
-        v.asList((item: Value) => item).asScala.flatMap { x =>
-          if (x == null || x.isNull) None
-          else {
-            val n = x.asNode()
-            Some(
-              GraphNode(
-                id = n.get("id").asString(),
-                label = n.labels().asScala.headOption.getOrElse("Concept"),
-                props = n.asMap().asScala.toMap
-              )
-            )
-          }
-        }.toSeq
-
-      val outNodes = convert(r.get("outNodes"))
-      val inNodes  = convert(r.get("inNodes"))
-      val coNodes  = convert(r.get("coNodes"))
-
-      val edges =
-        outNodes.map(n => GraphEdge(center.id, n.id, "RELATES_TO")) ++
-          inNodes.map(n => GraphEdge(n.id, center.id, "RELATES_TO")) ++
-          coNodes.map(n => GraphEdge(center.id, n.id, "CO_OCCURS"))
-
-      Some(
-        Neighborhood(
-          center = center,
-          nodes = outNodes ++ inNodes ++ coNodes,
-          edges = edges
-        )
-      )
-
-    } finally s.close()
+    ollamaClient.complete(prompt).getOrElse(
+      "Unable to generate an answer. Please try again."
+    )
   }
 
-  // ============================================================
-  // Close driver
-  // ============================================================
+  private def calculateConfidence(concepts: Seq[Concept], context: Seq[ContextItem]): Double = {
+    if (concepts.isEmpty) 0.0
+    else if (context.isEmpty) 0.2
+    else {
+      val coverage = context.size.toDouble / concepts.size.min(10)
+      Math.min(0.5 + (coverage * 0.5), 0.95)
+    }
+  }
+}
 
-  def close(): Unit =
-    driver.close()
+// Response models
+case class QueryResult(
+                        question: String,
+                        answer: String,
+                        concepts: Seq[Concept],
+                        context: Seq[ContextItem],
+                        confidence: Double
+                      )
+
+case class ContextItem(
+                        conceptId: String,
+                        conceptSurface: String,
+                        text: String,
+                        relatedConcepts: Seq[String],
+                        sourceUri: String
+                      )
+
+case class RelatedConcept(
+                           concept: Concept,
+                           predicate: String,
+                           confidence: Double
+                         )
+
+object QueryService {
+  def apply(driver: Driver, ollamaClient: OllamaClient): QueryService =
+    new QueryService(driver, ollamaClient)
+
+  def apply(config: Neo4jConfig, ollamaClient: OllamaClient): QueryService = {
+    val driver = Neo4jUtils.createDriver(config)
+    new QueryService(driver, ollamaClient)
+  }
 }

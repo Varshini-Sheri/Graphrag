@@ -35,7 +35,7 @@ services:
       MODE: job
       NEO4J_URI: neo4j+s://76aeed1c.databases.neo4j.io
       NEO4J_USER: neo4j
-      NEO4J_PASSWORD: 6pOf3FuN-jmGWdwUe-y1LPNJSuE6iohnYNAcUqupsNg
+      NEO4J_PASSWORD: 123
       NEO4J_DATABASE: neo4j
       OLLAMA_ENDPOINT: http://ollama:11434
       OLLAMA_MODEL: llama3-instruct
