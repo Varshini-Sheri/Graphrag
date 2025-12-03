@@ -246,7 +246,7 @@ sbt clean "job/assembly" "api/assembly"
 ### 2. Start Services
 
 ```bash
-cd deploy/docker
+cd deploy/
 docker-compose up -d --build
 ```
 
@@ -440,7 +440,7 @@ sbt clean compile test
 sbt "job/assembly" "api/assembly"
 
 # 3. Start full stack
-cd deploy/docker
+cd deploy/
 docker-compose up -d --build
 
 # 4. Verify (wait ~2 minutes for job completion)
