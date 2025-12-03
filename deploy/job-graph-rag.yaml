@@ -1,0 +1,19 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: graphrag-job
+spec:
+  template:
+    spec:
+      containers:
+      - name: graphrag
+        image: graphrag:latest
+        env:
+        - name: NEO4J_URI
+          value: "bolt://neo4j:7687"
+        - name: NEO4J_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: neo4j-secret
+              key: password
+      restartPolicy: OnFailure

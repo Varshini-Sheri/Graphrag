@@ -1,0 +1,80 @@
+#########################################
+# SCALA / SBT
+#########################################
+target/
+project/target/
+project/project/
+.metals/
+.bloop/
+.coursier/
+.ivy2/
+.cache/
+
+#########################################
+# IDE: IntelliJ / VSCode
+#########################################
+.idea/
+*.iml
+.vscode/
+
+#########################################
+# LOGS
+#########################################
+*.log
+*.out
+*.err
+logs/
+**/logs/
+**/trace*.jsonl
+
+#########################################
+# DATA (DON'T COMMIT GENERATED DATA)
+#########################################
+data/index/chunks-json/
+data/index/chunks.jsonl
+data/index/documents.jsonl
+data/neo4j/
+data/db/
+data/output/
+data/tmp/
+
+#########################################
+# DEPLOYMENT SECRETS
+#########################################
+deploy/docker/application.conf       # contains passwords
+deploy/scripts/application.conf      # contains configs/secrets
+*.env
+*.envrc
+*.credentials
+**/id_ed25519
+**/id_ed25519.pub
+
+#########################################
+# DOCKER
+#########################################
+docker-data/
+docker/volumes/
+docker-compose.override.yaml
+*.pid
+
+#########################################
+# FLINK
+#########################################
+flink-checkpoints/
+flink-savepoints/
+flink-data/
+**/checkpoint*
+**/savepoint*
+
+#########################################
+# OLLAMA (MODELS ARE 1–5GB EACH)
+#########################################
+deploy/ollama/models/
+deploy/ollama/blobs/
+deploy/ollama/manifests/
+
+#########################################
+# OS / MISC
+#########################################
+.DS_Store
+Thumbs.db

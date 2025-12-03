@@ -1,0 +1,71 @@
+version: "3.8"
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./ollama:/root/.ollama
+    networks:
+      - graphrag-net
+
+  ollama-pull:
+    image: curlimages/curl:latest
+    container_name: ollama-pull
+    depends_on:
+      - ollama
+    command: >
+      sh -c "sleep 10 && curl -X POST http://ollama:11434/api/pull -d '{\"name\": \"llama3-instruct\"}'"
+    restart: "no"
+    networks:
+      - graphrag-net
+
+  graphrag-job:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile
+    container_name: graphrag-job
+    restart: on-failure
+    depends_on:
+      - ollama-pull
+    environment:
+      MODE: job
+      NEO4J_URI: neo4j+s://76aeed1c.databases.neo4j.io
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: 6pOf3FuN-jmGWdwUe-y1LPNJSuE6iohnYNAcUqupsNg
+      NEO4J_DATABASE: neo4j
+      OLLAMA_ENDPOINT: http://ollama:11434
+      OLLAMA_MODEL: llama3-instruct
+    volumes:
+      - ../data/index:/app/data/index:ro
+    networks:
+      - graphrag-net
+
+  graphrag-api:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile
+    container_name: graphrag-api
+    restart: unless-stopped
+    depends_on:
+      - ollama
+    environment:
+      MODE: api
+      NEO4J_URI: neo4j+s://76aeed1c.databases.neo4j.io
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: 6pOf3FuN-jmGWdwUe-y1LPNJSuE6iohnYNAcUqupsNg
+      NEO4J_DATABASE: neo4j
+      OLLAMA_ENDPOINT: http://ollama:11434
+      OLLAMA_MODEL: llama3-instruct
+      API_PORT: 8080
+    ports:
+      - "8080:8080"
+    networks:
+      - graphrag-net
+
+networks:
+  graphrag-net:
+    driver: bridge

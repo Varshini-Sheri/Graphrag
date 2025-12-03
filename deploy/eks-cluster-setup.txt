@@ -1,0 +1,19 @@
+# EKS Cluster Setup
+
+## 1. Create EKS Cluster
+eksctl create cluster --name graphrag-cluster --region us-east-1 --nodegroup-name standard-workers --node-type t3.xlarge --nodes 3
+
+## 2. Install Flink Operator
+kubectl create namespace flink
+helm repo add flink-operator-repo https://downloads.apache.org/flink/flink-kubernetes-operator-1.6.0/
+helm install flink-kubernetes-operator flink-operator-repo/flink-kubernetes-operator --namespace flink
+
+## 3. Install Neo4j
+helm repo add neo4j https://helm.neo4j.com/neo4j
+helm install neo4j neo4j/neo4j --set neo4j.password=password
+
+## 4. Deploy Ollama
+kubectl apply -f ollama-daemonset.yaml
+
+## 5. Deploy GraphRAG Job
+kubectl apply -f job-graph-rag.yaml
