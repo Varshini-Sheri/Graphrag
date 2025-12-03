@@ -17,7 +17,7 @@ object CoOccurrence extends Logging {
     val concept = mention.concept
 
     // Temporary buffer stored inside mention (since CoOccur is window local)
-    val seen = mention.seenConcepts  // <-- YOU MUST add this field OR internal state
+    val seen = mention.seenConcepts
 
     // Build pairs
     seen.foreach { existing =>

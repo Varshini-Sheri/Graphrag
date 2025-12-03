@@ -24,7 +24,7 @@ object GraphUpsert extends Logging {
           Seq(CypherStatement(
             CypherTemplates.upsertChunk,
             Map(
-              "id"        -> id,  // ✅ Changed back to "id"
+              "id"        -> id,
               "docId"     -> props.getOrElse("docId", ""),
               "text"      -> props.getOrElse("text", ""),
               "spanStart" -> props.getOrElse("spanStart", 0),

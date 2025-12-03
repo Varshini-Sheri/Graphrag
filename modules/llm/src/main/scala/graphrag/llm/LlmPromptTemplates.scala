@@ -36,7 +36,7 @@ Respond ONLY with valid JSON (no markdown, no explanation):
 {"predicate": "relation_type", "confidence": 0.XX, "evidence": "brief explanation", "ref": "source"}"""
 
   def conceptExtractionPrompt(text: String): String = {
-    // ADD THIS LINE
+
     println("🟢 LlmPromptTemplates.conceptExtractionPrompt() CALLED - IMPROVED VERSION v2.0")
     s"""Extract key technical concepts from this software engineering research text.
 
