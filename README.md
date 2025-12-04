@@ -1,6 +1,6 @@
 # GraphRAG
 
-**Course:** CS441 – Distributed & Cloud Computing, Fall 2025  
+**Course:** CS441 – Engineering Distributed Objects For Cloud Computing, Fall 2025  
 **Institution:** University of Illinois Chicago (UIC)  
 **Author:** Varshini Sheri  
 **Email:** ssher9@uic.edu
@@ -453,6 +453,19 @@ curl http://localhost:8080/v1/graph/statistics
 - API: `http://localhost:8080`
 - Ollama: `http://localhost:11434`
 - Neo4j: Your Aura instance or `http://localhost:7474`
+
+---
+
+
+## Video Link
+
+Video Explanation - [www.youtube.com/watch?v=53DmazR6h-s](https://youtu.be/BqfpeyE8j18)
+
+---
+
+## Data Folders - Download
+
+Data - [(https://uofi.box.com/s/3y75o6ahnl1p9rymnkk836oub7nx0kem)](https://uofi.box.com/s/3y75o6ahnl1p9rymnkk836oub7nx0kem) (Download the documents.jsonl, chunks.jsonl)
 
 ---
 
