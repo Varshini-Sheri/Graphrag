@@ -1,7 +1,5 @@
 # GraphRAG
-
-**Course:** CS441 – Engineering Distributed Objects For Cloud Computing, Fall 2025  
-**Institution:** University of Illinois Chicago (UIC)  
+ 
 **Author:** Varshini Sheri  
 **Email:** ssher9@uic.edu
 
@@ -459,24 +457,17 @@ curl http://localhost:8080/v1/graph/statistics
 
 ## Video Link
 
-Video Explanation - [www.youtube.com/watch?v=53DmazR6h-s](https://youtu.be/BqfpeyE8j18)
+[Video Explanation](https://youtu.be/BqfpeyE8j18)
 
 ---
 
 ## Data Folders - Download
 
-Data - [(https://uofi.box.com/s/3y75o6ahnl1p9rymnkk836oub7nx0kem)](https://uofi.box.com/s/3y75o6ahnl1p9rymnkk836oub7nx0kem) (Download the documents.jsonl, chunks.jsonl)
+[(Data)](https://uofi.box.com/s/3y75o6ahnl1p9rymnkk836oub7nx0kem) (Download the documents.jsonl, chunks.jsonl)
 
 ---
 
-## License & Academic Integrity
-
-Educational project for CS441. Follow course policies on individual work and collaboration. Do not share implementation details before submission deadline.
 
 ---
 
-## Contact
 
-**Varshini Sheri**  
-ssher9@uic.edu  
-University of Illinois Chicago
