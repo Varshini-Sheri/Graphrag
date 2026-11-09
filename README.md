@@ -411,20 +411,6 @@ kubectl apply -f deploy/ollama-daemonset.yaml
 
 ---
 
-## How This Relates to CS441 Homework 3
-
-This implementation fulfills the HW3 requirements:
-
-✅ **Streaming Engine**: Apache Flink DataStream for scalable processing  
-✅ **LLM Integration**: Ollama for relation extraction and concept refinement  
-✅ **Graph Store**: Neo4j with idempotent MERGE operations  
-✅ **Versioned Schema**: Stable IDs for chunks and concepts  
-✅ **RESTful Services**: Query, evidence, and exploration endpoints  
-✅ **Cloud Deployment**: Docker Compose locally, EKS-ready for production
-
-Builds on HW1 (indexing) and HW2 (freshness) to create a complete GraphRAG pipeline with explainable, evidence-backed answers.
-
----
 
 ## Running Code
 
